@@ -1,0 +1,62 @@
+[
+  {
+    "id": "max_points_single_game",
+    "question": "Who scored the most points in a single game in this dataset, and how many points did they score?",
+    "must_include": ["Fox", "60"],
+    "expected_tools_any": ["analyze_nba_data", "search_nba_data", "get_nba_data_summary"]
+  },
+  {
+    "id": "top_three_point_maker",
+    "question": "Which player made the most three-pointers (3P) in total across the season in this dataset?",
+    "must_include": ["Anthony Edwards"],
+    "expected_tools_any": ["analyze_nba_data"]
+  },
+  {
+    "id": "top_assist_leader",
+    "question": "Which player had the most total assists (AST) in this dataset?",
+    "must_include": ["Trae Young"],
+    "expected_tools_any": ["analyze_nba_data"]
+  },
+  {
+    "id": "lebron_avg_points",
+    "question": "What is LeBron James' average points per game (PTS) in this dataset?",
+    "must_include": ["24"],
+    "expected_tools_any": ["analyze_nba_data", "search_nba_data"]
+  },
+  {
+    "id": "dataset_scale",
+    "question": "How many unique players and unique teams are in this dataset?",
+    "must_include": ["562", "30"],
+    "expected_tools_any": ["get_nba_data_summary", "analyze_nba_data"]
+  },
+  {
+    "id": "giannis_high_game",
+    "question": "Did Giannis Antetokounmpo ever score 59 points in a game in this dataset? If yes, against which opponent?",
+    "must_include": ["59", "DET"],
+    "expected_tools_any": ["search_nba_data", "analyze_nba_data", "lookup_player_games"]
+  },
+  {
+    "id": "max_rebounds_single_game",
+    "question": "Who recorded the most rebounds (TRB) in a single game in this dataset, and how many?",
+    "must_include": ["Sabonis", "28"],
+    "expected_tools_any": ["analyze_nba_data", "search_nba_data"]
+  },
+  {
+    "id": "second_three_point_maker",
+    "question": "Who had the second-most total three-pointers (3P) in this dataset?",
+    "must_include": ["Malik Beasley"],
+    "expected_tools_any": ["analyze_nba_data"]
+  },
+  {
+    "id": "jokic_total_assists",
+    "question": "How many total assists did Nikola Jokic (or Nikola Jokić) have in this dataset?",
+    "must_include": ["475"],
+    "expected_tools_any": ["analyze_nba_data", "search_nba_data"]
+  },
+  {
+    "id": "fox_sixty_opponent",
+    "question": "When De'Aaron Fox scored 60 points, which opponent did he face?",
+    "must_include": ["MIN"],
+    "expected_tools_any": ["search_nba_data", "analyze_nba_data", "lookup_player_games"]
+  }
+]

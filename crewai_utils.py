@@ -6,21 +6,61 @@ All functions can be imported and used from a Jupyter notebook.
 """
 
 import os
+import re
+import time
+import hashlib
+import threading
 import pandas as pd
-import chromadb
-from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
+from contextvars import ContextVar
 import json
 import traceback
-import gradio as gr
 
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai.tools import tool
+from pydantic import BaseModel, Field
+
+
+class SearchNbaDataInput(BaseModel):
+    """Optional filters — any subset may be omitted by the agent."""
+
+    query: str = Field(default="", description="Optional text to search across all columns")
+    column: str = Field(default="", description="Optional column name to filter")
+    value: str = Field(default="", description="Optional value to match in that column")
+    limit: int = Field(default=50, description="Max rows to return (default 50)")
+
+
+class LookupPlayerGamesInput(BaseModel):
+    """Player lookup — only player is required."""
+
+    player: str = Field(description="Player name or fragment (e.g. Giannis, Fox, LeBron)")
+    pts: Optional[float] = Field(default=None, description="Optional exact PTS filter; omit if unused")
+    min_pts: Optional[float] = Field(default=None, description="Optional minimum PTS; omit if unused")
+    limit: int = Field(default=20, description="Max rows to return (default 20)")
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Load KEY=VALUE pairs from .env into os.environ (does not override existing)."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key, value = key.strip(), value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
+_load_dotenv()
 
 # NBA Data Configuration
 NBA_DATA_PATH = "nba24-25.csv"
@@ -28,6 +68,12 @@ NBA_DATA_PATH = "nba24-25.csv"
 # OpenAI Configuration (ONLY PROVIDER)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+# Ask reliability / caching
+ASK_CACHE_TTL_S = int(os.getenv("ASK_CACHE_TTL_S", "3600"))
+ASK_MAX_RETRIES = int(os.getenv("ASK_MAX_RETRIES", "2"))
+ASK_MAX_TOOL_CALLS = int(os.getenv("ASK_MAX_TOOL_CALLS", "8"))
+ASK_GROUNDEDNESS_MIN = float(os.getenv("ASK_GROUNDEDNESS_MIN", "0.5"))
 
 
 def get_llm() -> LLM:
@@ -40,14 +86,16 @@ def get_llm() -> LLM:
     Raises:
         ValueError: If OPENAI_API_KEY is not set
     """
-    if not OPENAI_API_KEY:
+    api_key = os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY
+    model = os.getenv("OPENAI_MODEL") or OPENAI_MODEL
+    if not api_key:
         raise ValueError(
             "OPENAI_API_KEY environment variable is not set. "
             "Please set it using: export OPENAI_API_KEY='your-api-key'"
         )
     return LLM(
-        model=OPENAI_MODEL,
-        api_key=OPENAI_API_KEY
+        model=model,
+        api_key=api_key
     )
 
 
@@ -73,6 +121,11 @@ class NBAVectorDB:
         self.csv_path = csv_path
         self.collection_name = collection_name
         self.persist_directory = persist_directory
+
+        # Lazy imports — avoids breaking FastAPI startup when transformers versions clash
+        from sentence_transformers import SentenceTransformer
+        import chromadb
+        from chromadb.config import Settings
         
         # Initialize embedding model (open-source, runs locally)
         print("Loading embedding model...")
@@ -247,208 +300,582 @@ def get_vector_db(csv_path: str) -> NBAVectorDB:
 # TOOLS
 # ============================================================================
 
+_tool_trace_ctx: ContextVar[Optional[List[Dict[str, Any]]]] = ContextVar(
+    "nba_tool_trace", default=None
+)
+_tool_budget_ctx: ContextVar[Optional[Dict[str, int]]] = ContextVar(
+    "nba_tool_budget", default=None
+)
+
+# In-memory response cache: key -> {expires_at, payload}
+_ask_cache: Dict[str, Dict[str, Any]] = {}
+_ask_cache_lock = threading.Lock()
+_ask_cache_stats = {"hits": 0, "misses": 0}
+
+
+def begin_tool_trace(max_tool_calls: int = ASK_MAX_TOOL_CALLS) -> List[Dict[str, Any]]:
+    """Start collecting tool calls for the current request and reset the tool budget."""
+    trace: List[Dict[str, Any]] = []
+    _tool_trace_ctx.set(trace)
+    _tool_budget_ctx.set({"count": 0, "max": max(1, int(max_tool_calls))})
+    return trace
+
+
+def get_tool_trace() -> List[Dict[str, Any]]:
+    """Return the active tool trace (empty list if none)."""
+    return list(_tool_trace_ctx.get() or [])
+
+
+def clear_ask_cache() -> Dict[str, int]:
+    """Clear the in-memory ask cache. Returns previous size + hit/miss counters."""
+    with _ask_cache_lock:
+        size = len(_ask_cache)
+        _ask_cache.clear()
+        stats = dict(_ask_cache_stats)
+        _ask_cache_stats["hits"] = 0
+        _ask_cache_stats["misses"] = 0
+    return {"cleared": size, **stats}
+
+
+def get_ask_cache_stats() -> Dict[str, Any]:
+    with _ask_cache_lock:
+        return {
+            "size": len(_ask_cache),
+            "hits": _ask_cache_stats["hits"],
+            "misses": _ask_cache_stats["misses"],
+            "ttl_s": ASK_CACHE_TTL_S,
+        }
+
+
+def _normalize_question(question: str) -> str:
+    return re.sub(r"\s+", " ", question.strip().casefold())
+
+
+def _cache_key(question: str, data_path: str) -> str:
+    raw = f"{_normalize_question(question)}::{os.path.abspath(data_path)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _citation_from_record(record: Dict[str, Any], source_tool: str) -> Dict[str, Any]:
+    keys = ("Player", "Tm", "Opp", "PTS", "AST", "TRB", "FG%", "3P", "Data", "Res", "MP")
+    snippet = {k: record[k] for k in keys if k in record and record[k] is not None}
+    return {"source": "tool", "tool": source_tool, "snippet": snippet or record}
+
+
+def _record_tool_call(payload: Dict[str, Any]) -> None:
+    trace = _tool_trace_ctx.get()
+    if trace is None:
+        return
+
+    tool_name = payload.get("tool", "unknown")
+    citations: List[Dict[str, Any]] = []
+    for key in ("records", "sample", "results"):
+        items = payload.get(key) or []
+        if not isinstance(items, list):
+            continue
+        for item in items[:5]:
+            if isinstance(item, dict) and "record" in item and isinstance(item["record"], dict):
+                citations.append(_citation_from_record(item["record"], tool_name))
+            elif isinstance(item, dict):
+                citations.append(_citation_from_record(item, tool_name))
+
+    # Scalar / series results still need citation snippets for groundedness.
+    if isinstance(payload.get("data"), dict) and payload["data"]:
+        citations.append({"source": "tool", "tool": tool_name, "snippet": payload["data"]})
+    if "value" in payload and payload.get("ok", True):
+        citations.append({
+            "source": "tool",
+            "tool": tool_name,
+            "snippet": {"value": payload.get("value"), "result_type": payload.get("result_type")},
+        })
+
+    summary_bits = []
+    if "match_count" in payload:
+        summary_bits.append(f"match_count={payload['match_count']}")
+    if "returned" in payload:
+        summary_bits.append(f"returned={payload['returned']}")
+    if "total_rows" in payload:
+        summary_bits.append(f"total_rows={payload['total_rows']}")
+    if "result_type" in payload:
+        summary_bits.append(f"result_type={payload['result_type']}")
+    if "error" in payload:
+        summary_bits.append(f"error={payload['error']}")
+
+    # Compact evidence blob used by the groundedness gate.
+    evidence_parts = [json.dumps(payload, ensure_ascii=False, default=str)[:4000]]
+
+    trace.append({
+        "tool": tool_name,
+        "ok": bool(payload.get("ok", True)),
+        "summary": ", ".join(summary_bits) if summary_bits else ("ok" if payload.get("ok", True) else "error"),
+        "citations": citations,
+        "evidence": "\n".join(evidence_parts),
+    })
+
+
+def _normalize_text(value: Any) -> str:
+    """Lowercase and strip punctuation so DeAaron ~= De'Aaron."""
+    text = str(value or "").casefold()
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _series_contains_fuzzy(series: pd.Series, needle: str) -> pd.Series:
+    """Case-insensitive contains; also matches ignoring punctuation/apostrophes."""
+    needle = str(needle or "")
+    if not needle:
+        return pd.Series(False, index=series.index)
+    as_str = series.astype(str)
+    direct = as_str.str.contains(needle, case=False, na=False, regex=False)
+    norm_needle = _normalize_text(needle)
+    if not norm_needle:
+        return direct
+    # Vectorized-ish via map for fuzzy punctuation-insensitive match.
+    fuzzy = as_str.map(lambda x: norm_needle in _normalize_text(x))
+    return direct | fuzzy
+
+
+def _records_from_df(df: pd.DataFrame, limit: int) -> List[Dict]:
+    """Convert a DataFrame slice to JSON-safe dict records."""
+    return json.loads(df.head(limit).to_json(orient="records", date_format="iso"))
+
+
+def _tool_budget_exceeded() -> Optional[str]:
+    budget = _tool_budget_ctx.get()
+    if budget is None:
+        return None
+    if budget["count"] >= budget["max"]:
+        return f"Tool budget exceeded (max {budget['max']} calls per question)."
+    budget["count"] += 1
+    return None
+
+
+def _tool_json(payload: Dict) -> str:
+    """Serialize tool responses as compact JSON for the LLM and record the call."""
+    _record_tool_call(payload)
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _extract_stat_numbers(text: str) -> List[str]:
+    """Extract likely stat numbers; skip 4-digit years."""
+    nums = re.findall(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", text or "")
+    out = []
+    for n in nums:
+        if re.fullmatch(r"20\d{2}", n):  # years like 2024/2025
+            continue
+        out.append(n)
+    return out
+
+
+def assess_groundedness(
+    answer: str,
+    tool_trace: List[Dict[str, Any]],
+    citations: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Check whether numeric claims in the answer appear in tool evidence/citations.
+
+    Returns score in [0, 1], lists of grounded/ungrounded numbers, and whether
+    the answer should be refused.
+    """
+    evidence_parts = [c.get("evidence") or c.get("summary") or "" for c in tool_trace]
+    for cite in citations:
+        evidence_parts.append(json.dumps(cite.get("snippet") or cite, default=str))
+    evidence = "\n".join(evidence_parts)
+
+    answer_nums = _extract_stat_numbers(answer)
+    if not answer_nums:
+        # No numeric claims — treat as grounded if at least one tool succeeded.
+        any_ok = any(bool(t.get("ok")) for t in tool_trace)
+        return {
+            "score": 1.0 if any_ok else 0.0,
+            "grounded_numbers": [],
+            "ungrounded_numbers": [],
+            "refuse": not any_ok,
+            "reason": None if any_ok else "No successful tool calls to ground the answer.",
+        }
+
+    grounded, ungrounded = [], []
+    for n in answer_nums:
+        # Allow "24" to match "24.46" in evidence.
+        pattern = rf"(?<![\d.]){re.escape(n)}(?:\.\d+)?(?![\d])"
+        if re.search(pattern, evidence):
+            grounded.append(n)
+        else:
+            ungrounded.append(n)
+
+    score = len(grounded) / len(answer_nums) if answer_nums else 1.0
+    # Refuse only when grounding is weak overall (configurable threshold).
+    refuse = score < ASK_GROUNDEDNESS_MIN
+    reason = None
+    if refuse:
+        reason = (
+            "Answer contains numeric claims that were not found in tool results: "
+            + ", ".join(ungrounded[:8] or ["(none matched)"])
+        )
+    return {
+        "score": score,
+        "grounded_numbers": grounded,
+        "ungrounded_numbers": ungrounded,
+        "refuse": refuse,
+        "reason": reason,
+    }
+
+
 def get_agent_tools(data_path: str):
     """
     Get the list of tools available for agents.
-    
-    Args:
-        data_path: Path to the CSV data file
-    
-    Returns:
-        list: List of tools for agents to use
+
+    Every tool returns structured JSON (facts/stats), never raw CSV text dumps.
     """
-    
+
     def _read_nba_data(limit: int = 10) -> str:
-        """Read a sample of the NBA data file to understand its structure."""
+        budget_err = _tool_budget_exceeded()
+        if budget_err:
+            return _tool_json({"ok": False, "tool": "read_nba_data", "error": budget_err})
         try:
             df = pd.read_csv(data_path)
-            sample = df.head(limit)
-            return f"Dataset: {len(df):,} total records, {len(df.columns)} columns\n\nColumn names: {', '.join(df.columns.tolist())}\n\nSample (first {limit} rows):\n\n{sample.to_string()}"
+            limit = min(max(limit, 1), 50)
+            return _tool_json({
+                "ok": True,
+                "tool": "read_nba_data",
+                "total_rows": int(len(df)),
+                "columns": df.columns.tolist(),
+                "sample_limit": limit,
+                "sample": _records_from_df(df, limit),
+            })
         except Exception as e:
-            return f"Error reading file {data_path}: {str(e)}"
-    
+            return _tool_json({"ok": False, "tool": "read_nba_data", "error": str(e)})
+
     def _search_nba_data(
         query: Optional[str] = None,
         column: Optional[str] = None,
         value: Optional[str] = None,
-        limit: int = 100
+        limit: int = 50,
     ) -> str:
-        """Search and filter NBA data CSV file."""
+        budget_err = _tool_budget_exceeded()
+        if budget_err:
+            return _tool_json({"ok": False, "tool": "search_nba_data", "error": budget_err})
         try:
+            query = (query or "").strip()
+            column = (column or "").strip()
+            value = "" if value is None else str(value).strip()
             df = pd.read_csv(data_path)
-            
-            if column and value:
-                if column in df.columns:
-                    df = df[df[column].astype(str).str.contains(str(value), case=False, na=False)]
-                else:
-                    return f"Column '{column}' not found. Available columns: {', '.join(df.columns.tolist())}"
-            
-            if query:
-                mask = pd.Series([False] * len(df))
-                for col in df.columns:
-                    if df[col].dtype == 'object':
-                        mask |= df[col].astype(str).str.contains(query, case=False, na=False)
-                df = df[mask]
-            
-            limit = min(limit, 50)
-            df = df.head(limit)
-            
-            if len(df) == 0:
-                return "No matching records found."
-            
-            result_str = df.to_string()
-            if len(result_str) > 2000:
-                result_str = df.head(20).to_string() + f"\n\n... (showing first 20 of {len(df)} matching records)"
-            
-            return f"Found {len(df)} matching records:\n\n{result_str}"
-        except Exception as e:
-            return f"Error searching CSV {data_path}: {str(e)}"
-    
-    def _get_nba_data_summary() -> str:
-        """Get a concise summary of the NBA data file."""
-        try:
-            df = pd.read_csv(data_path)
-            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-            
-            summary = f"""NBA Dataset Summary:
-- Total Records: {len(df):,}
-- Columns: {len(df.columns)} ({', '.join(df.columns.tolist()[:10])}{'...' if len(df.columns) > 10 else ''})
-- Unique Players: {df['Player'].nunique() if 'Player' in df.columns else 'N/A'}
-- Unique Teams: {df['Tm'].nunique() if 'Tm' in df.columns else 'N/A'}
-- Date Range: {df['Data'].min() if 'Data' in df.columns else 'N/A'} to {df['Data'].max() if 'Data' in df.columns else 'N/A'}
-- Key Numeric Columns: {', '.join(numeric_cols[:10]) if numeric_cols else 'None'}
+            matched = len(df)
 
-Sample (first 3 rows):
-{df.head(3).to_string()}
-"""
-            return summary
+            # Targeted column filter (fuzzy for Player names / substring elsewhere).
+            if column and value:
+                if column not in df.columns:
+                    return _tool_json({
+                        "ok": False,
+                        "tool": "search_nba_data",
+                        "error": f"Column '{column}' not found",
+                        "available_columns": df.columns.tolist(),
+                    })
+                if column == "Player":
+                    df = df[_series_contains_fuzzy(df[column], value)]
+                else:
+                    df = df[df[column].astype(str).str.contains(str(value), case=False, na=False, regex=False)]
+
+            # Free-text query: search ALL columns as strings (including numeric PTS/AST/...).
+            if query:
+                mask = pd.Series(False, index=df.index)
+                for col in df.columns:
+                    if col == "Player":
+                        mask |= _series_contains_fuzzy(df[col], query)
+                    else:
+                        mask |= df[col].astype(str).str.contains(query, case=False, na=False, regex=False)
+                # Also match punctuation-stripped query against Player (DeAaron -> De'Aaron).
+                if "Player" in df.columns:
+                    mask |= _series_contains_fuzzy(df["Player"], query)
+                df = df[mask]
+
+            matched = len(df)
+            limit = min(max(limit, 1), 50)
+            hint = None
+            if matched == 0:
+                hint = (
+                    "No rows matched. Try lookup_player_games(player=..., pts=...) "
+                    "or analyze_nba_data with df['Player'].str.contains(...) & (df['PTS']==N)."
+                )
+            return _tool_json({
+                "ok": True,
+                "tool": "search_nba_data",
+                "filters": {"query": query, "column": column, "value": value},
+                "match_count": int(matched),
+                "returned": int(min(matched, limit)),
+                "records": _records_from_df(df, limit),
+                "hint": hint,
+            })
         except Exception as e:
-            return f"Error getting CSV summary for {data_path}: {str(e)}"
-    
+            return _tool_json({"ok": False, "tool": "search_nba_data", "error": str(e)})
+
+    def _lookup_player_games(
+        player: str,
+        pts: Optional[float] = None,
+        min_pts: Optional[float] = None,
+        limit: int = 20,
+    ) -> str:
+        """Reliable player/game lookup with fuzzy name match and optional PTS filters."""
+        budget_err = _tool_budget_exceeded()
+        if budget_err:
+            return _tool_json({"ok": False, "tool": "lookup_player_games", "error": budget_err})
+        try:
+            if not player or not str(player).strip():
+                return _tool_json({
+                    "ok": False,
+                    "tool": "lookup_player_games",
+                    "error": "player is required (e.g. 'Giannis' or \"De'Aaron Fox\")",
+                })
+            df = pd.read_csv(data_path)
+            if "Player" not in df.columns:
+                return _tool_json({"ok": False, "tool": "lookup_player_games", "error": "Player column missing"})
+
+            # Treat negative sentinels as "no filter" (agents sometimes pass -1).
+            if pts is not None and float(pts) < 0:
+                pts = None
+            if min_pts is not None and float(min_pts) < 0:
+                min_pts = None
+
+            out = df[_series_contains_fuzzy(df["Player"], player)]
+            if pts is not None and "PTS" in out.columns:
+                out = out[out["PTS"] == float(pts)]
+            if min_pts is not None and "PTS" in out.columns:
+                out = out[out["PTS"] >= float(min_pts)]
+
+            # Prefer highest-scoring games first for inspection.
+            if "PTS" in out.columns:
+                out = out.sort_values("PTS", ascending=False)
+
+            matched = len(out)
+            limit = min(max(int(limit or 20), 1), 50)
+            cols = [c for c in ("Player", "Tm", "Opp", "PTS", "AST", "TRB", "3P", "Data", "Res", "MP") if c in out.columns]
+            return _tool_json({
+                "ok": True,
+                "tool": "lookup_player_games",
+                "filters": {"player": player, "pts": pts, "min_pts": min_pts},
+                "match_count": int(matched),
+                "returned": int(min(matched, limit)),
+                "records": _records_from_df(out[cols] if cols else out, limit),
+            })
+        except Exception as e:
+            return _tool_json({"ok": False, "tool": "lookup_player_games", "error": str(e)})
+
+    def _get_nba_data_summary() -> str:
+        budget_err = _tool_budget_exceeded()
+        if budget_err:
+            return _tool_json({"ok": False, "tool": "get_nba_data_summary", "error": budget_err})
+        try:
+            df = pd.read_csv(data_path)
+            numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+            return _tool_json({
+                "ok": True,
+                "tool": "get_nba_data_summary",
+                "total_rows": int(len(df)),
+                "columns": df.columns.tolist(),
+                "numeric_columns": numeric_cols,
+                "unique_players": int(df["Player"].nunique()) if "Player" in df.columns else None,
+                "unique_teams": int(df["Tm"].nunique()) if "Tm" in df.columns else None,
+                "date_range": {
+                    "min": str(df["Data"].min()) if "Data" in df.columns else None,
+                    "max": str(df["Data"].max()) if "Data" in df.columns else None,
+                },
+                "missing_values": {col: int(v) for col, v in df.isnull().sum().items() if v > 0},
+                "sample": _records_from_df(df, 3),
+            })
+        except Exception as e:
+            return _tool_json({"ok": False, "tool": "get_nba_data_summary", "error": str(e)})
+
     @tool("read_nba_data")
     def read_nba_data(limit: int = 10) -> str:
         """
-        Read a sample of the NBA data file to understand its structure.
-        
+        Return a JSON sample of NBA rows plus schema metadata.
+
         Args:
-            limit: Number of sample rows to return (default: 10, max: 50)
+            limit: Number of sample rows (default 10, max 50)
         """
-        limit = min(limit, 50)
-        return _read_nba_data(limit)
-    
+        return _read_nba_data(min(limit, 50))
+
     @tool("search_nba_data")
     def search_nba_data(
         query: Optional[str] = None,
         column: Optional[str] = None,
         value: Optional[str] = None,
-        limit: int = 100
+        limit: Optional[int] = 50,
     ) -> str:
         """
-        Search and filter NBA data CSV file.
-        
+        Search/filter NBA data and return matching rows as JSON records.
+        Searches numeric columns too (so query='59' can match PTS).
+        Player matching ignores punctuation (DeAaron ~= De'Aaron).
+        You may pass only query — column/value/limit are optional.
+
         Args:
-            query: Optional text query to search for in any column
-            column: Optional column name to filter by
-            value: Optional value to match in the specified column
-            limit: Maximum number of rows to return (default: 100)
+            query: Optional text to search across all columns (e.g. 'LeBron James')
+            column: Optional column name to filter (e.g. 'Player', 'PTS')
+            value: Optional value to match in that column
+            limit: Max rows to return (default 50)
         """
-        return _search_nba_data(query, column, value, limit)
-    
+        return _search_nba_data(query, column, value, int(limit or 50))
+
+    # CrewAI's @tool marks every arg required unless we override args_schema.
+    search_nba_data.args_schema = SearchNbaDataInput
+
+    @tool("lookup_player_games")
+    def lookup_player_games(
+        player: str,
+        pts: Optional[float] = None,
+        min_pts: Optional[float] = None,
+        limit: Optional[int] = 20,
+    ) -> str:
+        """
+        Look up games for a player with fuzzy name match.
+        Only `player` is required. pts/min_pts are optional filters.
+
+        Args:
+            player: Player name or fragment (e.g. 'Giannis', 'Fox', 'LeBron')
+            pts: Optional exact PTS filter (e.g. 59 or 60). Omit if not filtering.
+            min_pts: Optional minimum PTS filter. Omit if not filtering.
+            limit: Max rows to return (default 20)
+        """
+        return _lookup_player_games(player, pts=pts, min_pts=min_pts, limit=int(limit or 20))
+
+    lookup_player_games.args_schema = LookupPlayerGamesInput
+
     @tool("get_nba_data_summary")
     def get_nba_data_summary() -> str:
-        """Get a comprehensive summary of the NBA data file."""
+        """Return a JSON summary of dataset shape, coverage, and missing values."""
         return _get_nba_data_summary()
-    
+
     def _semantic_search_nba_data(query: str, n_results: int = 10) -> str:
-        """Perform semantic search on NBA data using vector embeddings."""
+        budget_err = _tool_budget_exceeded()
+        if budget_err:
+            return _tool_json({"ok": False, "tool": "semantic_search_nba_data", "error": budget_err})
         try:
+            n_results = min(max(n_results, 1), 50)
             vector_db = get_vector_db(data_path)
             results = vector_db.search(query, n_results=n_results)
-            
+
             if not results:
-                return f"No results found for query: '{query}'"
-            
-            output = [f"Semantic search results for: '{query}'\n"]
-            output.append(f"Found {len(results)} similar records:\n")
-            output.append("=" * 80 + "\n")
-            
+                return _tool_json({
+                    "ok": True,
+                    "tool": "semantic_search_nba_data",
+                    "query": query,
+                    "match_count": 0,
+                    "results": [],
+                })
+
             df = pd.read_csv(data_path)
-            
-            for i, result in enumerate(results, 1):
-                metadata = result['metadata']
-                similarity = result['similarity']
-                row_index = metadata.get('row_index', -1)
-                
-                output.append(f"\nResult {i} (Similarity: {similarity:.3f}):")
-                output.append(f"Document: {result['document']}\n")
-                
-                if row_index >= 0 and row_index < len(df):
-                    row = df.iloc[row_index]
-                    output.append("Full record:")
-                    output.append(row.to_string())
-                    output.append("\n" + "-" * 80 + "\n")
-            
-            return "\n".join(output)
+            payload_results = []
+            for result in results:
+                metadata = result["metadata"]
+                row_index = metadata.get("row_index", -1)
+                record = None
+                if 0 <= row_index < len(df):
+                    record = json.loads(
+                        df.iloc[[row_index]].to_json(orient="records", date_format="iso")
+                    )[0]
+                payload_results.append({
+                    "similarity": float(result["similarity"]),
+                    "row_index": row_index,
+                    "document": result["document"],
+                    "record": record,
+                })
+
+            return _tool_json({
+                "ok": True,
+                "tool": "semantic_search_nba_data",
+                "query": query,
+                "match_count": len(payload_results),
+                "results": payload_results,
+            })
         except Exception as e:
-            return f"Error performing semantic search: {str(e)}"
-    
+            return _tool_json({"ok": False, "tool": "semantic_search_nba_data", "error": str(e)})
+
     @tool("semantic_search_nba_data")
     def semantic_search_nba_data(query: str, n_results: int = 10) -> str:
         """
-        Perform semantic search on NBA data using vector embeddings.
-        
+        Semantic search over NBA rows; returns JSON with similarity + full records.
+
         Args:
             query: Natural language query
-            n_results: Number of results to return (default: 10, max: 50)
+            n_results: Number of results (default 10, max 50)
         """
-        n_results = min(n_results, 50)
         return _semantic_search_nba_data(query, n_results)
-    
+
     def _analyze_nba_data(pandas_code: str) -> str:
-        """Execute pandas operations on NBA data for advanced analysis."""
+        budget_err = _tool_budget_exceeded()
+        if budget_err:
+            return _tool_json({"ok": False, "tool": "analyze_nba_data", "error": budget_err})
         try:
             df = pd.read_csv(data_path)
-            namespace = {
-                'pd': pd,
-                'df': df,
-                '__builtins__': __builtins__
-            }
-            
+            namespace = {"pd": pd, "df": df, "__builtins__": __builtins__}
             exec(f"result = {pandas_code}", namespace)
-            result = namespace.get('result')
-            
+            result = namespace.get("result")
+
             if isinstance(result, pd.DataFrame):
-                if len(result) > 50:
-                    result_str = f"{result.head(50).to_string()}\n\n... (showing first 50 of {len(result)} rows)"
-                else:
-                    result_str = result.to_string()
-                return f"Analysis Result ({result.shape[0]} rows, {result.shape[1]} cols):\n\n{result_str}"
-            elif isinstance(result, pd.Series):
-                if len(result) > 50:
-                    result_str = f"{result.head(50).to_string()}\n\n... (showing first 50 of {len(result)} items)"
-                else:
-                    result_str = result.to_string()
-                return f"Analysis Result ({len(result)} items):\n\n{result_str}"
-            else:
-                result_str = str(result)
-                if len(result_str) > 2000:
-                    result_str = result_str[:2000] + "\n\n... (truncated)"
-                return f"Analysis Result:\n\n{result_str}"
-                
+                truncated = len(result) > 50
+                return _tool_json({
+                    "ok": True,
+                    "tool": "analyze_nba_data",
+                    "result_type": "dataframe",
+                    "shape": [int(result.shape[0]), int(result.shape[1])],
+                    "truncated": truncated,
+                    "records": _records_from_df(result, 50),
+                })
+            if isinstance(result, pd.Series):
+                truncated = len(result) > 50
+                series = result.head(50)
+                return _tool_json({
+                    "ok": True,
+                    "tool": "analyze_nba_data",
+                    "result_type": "series",
+                    "length": int(len(result)),
+                    "truncated": truncated,
+                    "data": json.loads(series.to_json(date_format="iso")),
+                })
+
+            value = result
+            if isinstance(result, (pd.Timestamp,)):
+                value = str(result)
+            elif hasattr(result, "item"):
+                try:
+                    value = result.item()
+                except Exception:
+                    value = str(result)
+
+            return _tool_json({
+                "ok": True,
+                "tool": "analyze_nba_data",
+                "result_type": type(result).__name__,
+                "value": value,
+            })
         except Exception as e:
-            return f"Error executing pandas code: {str(e)}\n\nMake sure your code uses 'df' as the DataFrame variable and returns a result."
-    
+            return _tool_json({
+                "ok": False,
+                "tool": "analyze_nba_data",
+                "error": str(e),
+                "hint": "Use 'df' as the DataFrame and write an expression that assigns to result.",
+            })
+
     @tool("analyze_nba_data")
     def analyze_nba_data(pandas_code: str) -> str:
         """
-        Execute pandas operations on NBA data for advanced analysis.
-        
+        Run a pandas expression on df and return the result as JSON.
+
         Args:
-            pandas_code: Valid pandas code that operates on a DataFrame variable named 'df'
+            pandas_code: Expression using DataFrame variable 'df' (e.g. df.groupby('Tm')['PTS'].mean())
         """
         return _analyze_nba_data(pandas_code)
-    
-    return [read_nba_data, search_nba_data, get_nba_data_summary, semantic_search_nba_data, analyze_nba_data]
+
+    # semantic_search_nba_data is implemented but currently omitted from the default
+    # toolset: conda envs often break on sentence-transformers/transformers imports.
+    # Re-add after: pip install -U "transformers>=4.41,<5" sentence-transformers
+    return [
+        read_nba_data,
+        search_nba_data,
+        lookup_player_games,
+        get_nba_data_summary,
+        analyze_nba_data,
+    ]
 
 
 # ============================================================================
@@ -516,11 +943,16 @@ def create_analyst_agent(csv_path: str = None) -> Agent:
         
         CRITICAL: When asked for aggregations, top N lists, totals, or statistical summaries:
         - ALWAYS use the 'analyze_nba_data' tool with pandas groupby operations
-        - NEVER use semantic_search_nba_data for aggregation queries (it only returns individual records)
+        - NEVER invent numbers that are not present in tool JSON
+        - Prefer 1-3 tool calls; stop once you have enough evidence
+        - For player+points lookups, prefer lookup_player_games(player=..., pts=...)
+        - If a search returns 0 rows, retry with a different tool before concluding not found
         - For "top 5 three-point shooters": use analyze_nba_data with groupby('Player')['3P'].sum()
         - Plan your analysis: understand what aggregation is needed, then write the appropriate pandas code""",
         verbose=True,
         allow_delegation=False,
+        max_iter=8,
+        max_retry_limit=1,
         llm=_get_llm_instance(),
         tools=agent_tools,
     )
@@ -649,30 +1081,30 @@ def create_custom_analysis_task(analyst_agent, user_query: str, data_engineering
     
     return Task(
         description=f"""
-        Using the dataset located at {data_path}, perform the following analysis as requested by the user:
-        
+        Using the dataset located at {data_path}, answer this user question:
+
         {user_query}
-        
-        IMPORTANT INSTRUCTIONS:
-        1. For queries requiring aggregations (sum, count, average, top N, etc.), you MUST use the 'analyze_nba_data' tool.
-        2. The 'analyze_nba_data' tool allows you to execute pandas code for grouping, aggregating, sorting, and filtering.
-        3. Examples of when to use 'analyze_nba_data':
-           - Finding top players by statistics (e.g., "top 5 three-point shooters")
-           - Calculating totals or averages per player/team
-           - Grouping and aggregating data
-           - Statistical analysis requiring groupby operations
-        4. Use 'semantic_search_nba_data' only for finding specific game records or examples, NOT for aggregations.
-        5. Plan your analysis: First understand what data you need, then use the appropriate tool to get aggregated results.
-        
-        Steps to follow:
-        1. If the query asks for "top N" or aggregations, use analyze_nba_data with pandas groupby operations
-        2. For "top 5 three-point shooters": group by Player, sum the '3P' column, sort descending, take top 5
-        3. Present the results clearly with player names and their statistics
-        
-        Provide a clear, comprehensive answer with relevant statistics, insights, and any supporting data from the dataset.
+
+        CRITICAL RULES:
+        1. You MUST call tools to get facts before answering. Do not invent stats.
+        2. For averages / totals / top-N, use analyze_nba_data with pandas on `df` (one call).
+           Example avg: df[df['Player'].str.contains('LeBron', case=False, na=False)]['PTS'].mean()
+        3. For "Did player X score Y?" / "opponent when X scored Y", use
+           lookup_player_games with player='X' and pts=Y.
+        4. search_nba_data: you may pass only query (column/value optional). Prefer analyze for averages.
+        5. Use get_nba_data_summary for unique players/teams / dataset scale.
+        6. Prefer 1-2 tool calls. Stop once you have the answer.
+        7. If a tool errors or returns 0 matches, retry once with analyze_nba_data — then stop.
+        8. Every number in your answer must come from tool JSON output.
+        9. Include opponent (Opp), player, and the key stat when available.
+
+        RESPONSE FORMAT:
+        - Lead with a direct answer.
+        - Include concrete numbers from tool results.
+        - End with a short "Sources:" section listing tool name(s) and key facts (player/team/stat/date).
         """,
         agent=analyst_agent,
-        expected_output="A detailed analysis report addressing the user's query with relevant insights, statistics, and findings from the data.",
+        expected_output="A grounded answer with concrete statistics from tool results, plus a short Sources section.",
         context=context
     )
 
@@ -851,6 +1283,130 @@ def create_analyst_only_crew(user_query: str, csv_path: str) -> Crew:
     )
 
 
+def run_ask(
+    question: str,
+    csv_path: Optional[str] = None,
+    use_cache: bool = True,
+    max_retries: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Answer a natural-language NBA question via the analyst crew.
+
+    Features:
+    - In-memory TTL cache (normalized question + data path)
+    - Tool-call budget per request
+    - Crew kickoff retries with exponential backoff
+    - Groundedness gate (refuse if numeric claims are ungrounded)
+    """
+    if not question or not question.strip():
+        raise ValueError("question must be a non-empty string")
+
+    data_path = csv_path or NBA_DATA_PATH
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"NBA data file not found: {data_path}")
+
+    global OPENAI_API_KEY
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY is not set")
+
+    q = question.strip()
+    key = _cache_key(q, data_path)
+    retries = ASK_MAX_RETRIES if max_retries is None else max(0, int(max_retries))
+
+    if use_cache:
+        with _ask_cache_lock:
+            hit = _ask_cache.get(key)
+            if hit and hit.get("expires_at", 0) > time.time():
+                _ask_cache_stats["hits"] += 1
+                cached = dict(hit["payload"])
+                cached["cached"] = True
+                cached["latency_ms"] = 0
+                return cached
+            _ask_cache_stats["misses"] += 1
+
+    last_error: Optional[Exception] = None
+    answer = ""
+    trace: List[Dict[str, Any]] = []
+    attempts_used = 0
+    started = time.perf_counter()
+
+    for attempt in range(retries + 1):
+        attempts_used = attempt + 1
+        trace = begin_tool_trace(ASK_MAX_TOOL_CALLS)
+        try:
+            crew = create_analyst_only_crew(q, data_path)
+            result = crew.kickoff()
+            answer = str(result)
+            if hasattr(result, "raw") and result.raw:
+                answer = str(result.raw)
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(0.4 * (2 ** attempt))
+                continue
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    if last_error is not None:
+        raise RuntimeError(f"ask failed after {attempts_used} attempt(s): {last_error}") from last_error
+
+    citations: List[Dict[str, Any]] = []
+    seen = set()
+    for entry in trace:
+        for cite in entry.get("citations") or []:
+            key_c = json.dumps(cite.get("snippet") or cite, sort_keys=True, default=str)
+            if key_c in seen:
+                continue
+            seen.add(key_c)
+            citations.append(cite)
+            if len(citations) >= 10:
+                break
+        if len(citations) >= 10:
+            break
+
+    grounding = assess_groundedness(answer, trace, citations)
+    refused = bool(grounding.get("refuse"))
+    if refused:
+        reason = grounding.get("reason") or "Insufficient grounded evidence from tools."
+        answer = (
+            "I cannot confidently answer from the available tool results. "
+            f"{reason} "
+            "Please rephrase or ask a more specific factual question."
+        )
+
+    tool_trace = [
+        {"tool": e["tool"], "ok": e["ok"], "summary": e["summary"]}
+        for e in trace
+    ]
+
+    payload = {
+        "question": q,
+        "answer": answer,
+        "citations": citations,
+        "tool_trace": tool_trace,
+        "latency_ms": latency_ms,
+        "model": os.getenv("OPENAI_MODEL") or OPENAI_MODEL,
+        "data_path": data_path,
+        "cached": False,
+        "groundedness": grounding.get("score"),
+        "refused": refused,
+        "retries_used": max(0, attempts_used - 1),
+    }
+
+    # Only cache successful grounded answers.
+    if use_cache and not refused:
+        with _ask_cache_lock:
+            _ask_cache[key] = {
+                "expires_at": time.time() + ASK_CACHE_TTL_S,
+                "payload": {**payload, "cached": True},
+            }
+
+    return payload
+
+
 # ============================================================================
 # APP FUNCTIONS
 # ============================================================================
@@ -966,6 +1522,8 @@ def process_question_only(file, user_query: str) -> str:
 
 def create_app():
     """Create and return the Gradio interface."""
+    import gradio as gr
+
     with gr.Blocks(title="NBA Stats Analysis with CrewAI", theme=gr.themes.Soft()) as app:
         gr.Markdown("""
         # NBA Stats Analysis with CrewAI
